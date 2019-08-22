@@ -65,7 +65,15 @@ func parse(id int, entry <-chan Entry, results chan<- CertJob) {
 func main() {
 	start := time.Now()
 
-	response := doRequest()
+	response := doRequest("https://ct.googleapis.com/rocketeer/ct/v1/get-entries?start=1&end=2000")
+	initRequests(response)
+
+	elapsed := time.Since(start)
+	log.Printf("Run took %s", elapsed)
+}
+
+func initRequests(response Response) {
+
 	maxLenght := len(response.Entries)
 
 	jobs := make(chan Entry, maxLenght)
@@ -85,14 +93,10 @@ func main() {
 		certJob := <-results
 		fmt.Println(certJob.Success)
 	}
-
-	elapsed := time.Since(start)
-	log.Printf("Run took %s", elapsed)
-
 }
 
-func doRequest() Response {
-	response, err := http.Get("https://ct.googleapis.com/rocketeer/ct/v1/get-entries?start=1&end=2000")
+func doRequest(url string) Response {
+	response, err := http.Get(url)
 
 	if err != nil {
 		fmt.Print(err.Error())
