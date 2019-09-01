@@ -11,18 +11,20 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/go-pg/pg"
 	"github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go/snappy"
 	"github.com/wiardvanrij/worker/parser"
 )
 
-const addr = "localhost:5432"
+const addr = "postgres-postgresql.postgres.svc.cluster.local:5432"
 const user = "postgres"
-const password = "password"
+const password = "postgrespass"
 const database = "postgres"
 
 type DBOffset struct {
@@ -53,6 +55,8 @@ type CertJob struct {
 }
 
 type CertificatePush struct {
+	LogId                 int
+	LogUrl                string
 	Version               int
 	SerialNumber          *big.Int
 	Issuer                pkix.Name
@@ -90,9 +94,10 @@ func parse(id int, entry <-chan Entry, results chan<- CertJob) {
 				cert, err := x509.ParseCertificate(result.X509Cert)
 				if err != nil {
 					fmt.Println(err)
+				} else {
+					certJob.Cert = cert
+					certJob.Success = true
 				}
-				certJob.Cert = cert
-				certJob.Success = true
 			}
 		}
 
@@ -102,16 +107,41 @@ func parse(id int, entry <-chan Entry, results chan<- CertJob) {
 
 func main() {
 
-	startFetch(1, "https://ct.googleapis.com/rocketeer")
-	startFetch(2, "https://oak.ct.letsencrypt.org/2019")
-	startFetch(3, "https://oak.ct.letsencrypt.org/2020")
-	startFetch(4, "https://oak.ct.letsencrypt.org/2021")
+	id := os.Getenv("id")
+	url := os.Getenv("url")
+	limit := os.Getenv("limit")
+	interval := os.Getenv("interval")
 
-	//time.Sleep(10 * time.Minute)
+	idInt, err := strconv.Atoi(id)
+	if err == nil {
+		fmt.Println(err)
+	}
+
+	limitInt, err := strconv.Atoi(limit)
+	if err == nil {
+		fmt.Println(err)
+	}
+
+	intervalInt, err := strconv.Atoi(interval)
+	if err == nil {
+		fmt.Println(err)
+	}
+
+	intervalTime := float64(intervalInt)
+
+	startFetch(idInt, url, limitInt, intervalTime)
+
+	// startFetch(1, "https://ct.googleapis.com/rocketeer")
+	// startFetch(2, "https://oak.ct.letsencrypt.org/2019")
+	// startFetch(3, "https://ct.googleapis.com/logs/argon2019")
+	//startFetch(4, "https://ct.googleapis.com/logs/xenon2019")
+	// startFetch(5, "https://ct.cloudflare.com/logs/nimbus2019")
+
+	select {}
 
 }
 
-func startFetch(id int, url string) {
+func startFetch(id int, url string, limit int, intervalTime float64) {
 
 	var Database *pg.DB
 	Database = pg.Connect(&pg.Options{
@@ -127,30 +157,52 @@ func startFetch(id int, url string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	Database.Close()
 
 	start := dboffset.Offset
-	limit := 100
 	end := 0
 	ticketC := 0
 
-	ticker := time.NewTicker(1 * time.Second)
+	if start == 1 {
+		_, set := os.LookupEnv("fromEnd")
+		if set {
+			head, err := fetchHead(url + "/ct/v1/get-sth")
+			if err != nil {
+				fmt.Println(err)
+				// Lets sleep to give head some time
+				log.Fatal("cannot get head.hehe")
+			}
+			start = head.TreeSize
+			fmt.Printf("sleeping 5 seconds to give head some time to update")
+			time.Sleep(5 * time.Second)
+		}
+	}
+
+	sleep := 0
+
+	ticker := time.NewTicker(time.Duration(intervalTime) * time.Millisecond)
 	go func() {
 		for t := range ticker.C {
 			ticketC++
 			fmt.Println("Tick at", t, url)
+
+			if sleep > 0 {
+				fmt.Println("Sleeping ", sleep)
+				sleep--
+				continue
+			}
+
 			head, err := fetchHead(url + "/ct/v1/get-sth")
 			if err != nil {
-				// Lets sleep to give head some time
-				fmt.Println("sleep at head")
-				time.Sleep(1 * time.Minute)
+				fmt.Println(err)
 				continue
 			}
 
 			if head.TreeSize > (start+limit)-1 {
 				end = (start + limit) - 1
-			} else if head.TreeSize == start {
+			} else if head.TreeSize == start-1 {
 				fmt.Println("up to date, waiting")
-				time.Sleep(10 * time.Second)
+				sleep = 5
 				continue
 			} else {
 				end = head.TreeSize
@@ -158,18 +210,15 @@ func startFetch(id int, url string) {
 
 			endString := strconv.Itoa(end)
 			startString := strconv.Itoa(start)
-
+			fmt.Println("Start: " + startString + "End: " + endString)
 			response, err := doRequest(url + "/ct/v1/get-entries?start=" + startString + "&end=" + endString)
 			if err != nil {
-				// Lets sleep to give entries some time
-				fmt.Println("sleep at entries")
-				time.Sleep(30 * time.Second)
 				continue
 			}
 			start = end + 1
-			initRequests(response, url)
+			go initRequests(response, url, id)
 
-			if ticketC == 10 {
+			if ticketC == 60 {
 				ticketC = 0
 				var Database *pg.DB
 				Database = pg.Connect(&pg.Options{
@@ -196,19 +245,21 @@ func startFetch(id int, url string) {
 					fmt.Println("updateJobDBUpdate")
 				}
 
+				Database.Close()
+
 			}
 
 		}
 	}()
 }
 
-func initRequests(response Response, url string) {
+func initRequests(response Response, url string, id int) {
 
 	maxLength := len(response.Entries)
 	jobs := make(chan Entry, maxLength)
 	results := make(chan CertJob, maxLength)
 
-	for w := 1; w <= 100; w++ {
+	for w := 1; w <= 20; w++ {
 		go parse(w, jobs, results)
 	}
 
@@ -220,8 +271,8 @@ func initRequests(response Response, url string) {
 	buffers := make(chan bool, 100)
 	var wg sync.WaitGroup
 
-	kafkaURL := "127.0.0.1:9092"
-	topic := "testing5"
+	kafkaURL := "kafka-headless.kafka:9092"
+	topic := "certlog"
 	writer := newKafkaWriter(kafkaURL, topic)
 	defer writer.Close()
 
@@ -240,6 +291,8 @@ func initRequests(response Response, url string) {
 				buffers <- true
 
 				certPush := CertificatePush{
+					LogId:                 id,
+					LogUrl:                url,
 					Version:               certJob.Cert.Version,
 					SerialNumber:          certJob.Cert.SerialNumber,
 					Issuer:                certJob.Cert.Issuer,
@@ -258,7 +311,7 @@ func initRequests(response Response, url string) {
 
 				} else {
 					msg := kafka.Message{
-						Key:   []byte(fmt.Sprintf("Key-%d", i)),
+						Key:   []byte(fmt.Sprintf("cert-%d", certJob.Cert.SerialNumber)),
 						Value: []byte(json),
 					}
 					err := writer.WriteMessages(context.Background(), msg)
@@ -284,9 +337,10 @@ func initRequests(response Response, url string) {
 
 func newKafkaWriter(kafkaURL, topic string) *kafka.Writer {
 	return kafka.NewWriter(kafka.WriterConfig{
-		Brokers:  []string{kafkaURL},
-		Topic:    topic,
-		Balancer: &kafka.LeastBytes{},
+		Brokers:          []string{kafkaURL},
+		Topic:            topic,
+		Balancer:         &kafka.LeastBytes{},
+		CompressionCodec: snappy.NewCompressionCodec(),
 	})
 }
 
