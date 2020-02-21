@@ -13,10 +13,8 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 
-	"github.com/go-pg/pg"
 	"github.com/segmentio/kafka-go"
 	"github.com/segmentio/kafka-go/snappy"
 	"github.com/wiardvanrij/worker/parser"
@@ -55,8 +53,6 @@ type CertJob struct {
 }
 
 type CertificatePush struct {
-	LogId                 int
-	LogUrl                string
 	Version               int
 	SerialNumber          *big.Int
 	Issuer                pkix.Name
@@ -69,8 +65,11 @@ type CertificatePush struct {
 	CRLDistributionPoints []string
 }
 
-func parse(id int, entry <-chan Entry, results chan<- CertJob) {
-	for job := range entry {
+func parse(entry []Entry) []*x509.Certificate {
+
+	var results []*x509.Certificate
+
+	for _, job := range entry {
 
 		var certJob CertJob
 		certJob.Success = false
@@ -95,27 +94,24 @@ func parse(id int, entry <-chan Entry, results chan<- CertJob) {
 				if err != nil {
 					fmt.Println(err)
 				} else {
-					certJob.Cert = cert
-					certJob.Success = true
+					results = append(results, cert)
 				}
 			}
 		}
 
-		results <- certJob
 	}
+	return results
 }
 
 func main() {
 
-	id := os.Getenv("id")
 	url := os.Getenv("url")
 	limit := os.Getenv("limit")
 	interval := os.Getenv("interval")
 
-	idInt, err := strconv.Atoi(id)
-	if err == nil {
-		fmt.Println(err)
-	}
+	url = "https://oak.ct.letsencrypt.org/2020"
+	limit = "20"
+	interval = "5000"
 
 	limitInt, err := strconv.Atoi(limit)
 	if err == nil {
@@ -129,72 +125,39 @@ func main() {
 
 	intervalTime := float64(intervalInt)
 
-	startFetch(idInt, url, limitInt, intervalTime)
-
-	// startFetch(1, "https://ct.googleapis.com/rocketeer")
-	// startFetch(2, "https://oak.ct.letsencrypt.org/2019")
-	// startFetch(3, "https://ct.googleapis.com/logs/argon2019")
-	//startFetch(4, "https://ct.googleapis.com/logs/xenon2019")
-	// startFetch(5, "https://ct.cloudflare.com/logs/nimbus2019")
+	startFetch(url, limitInt, intervalTime)
 
 	select {}
 
 }
 
-func startFetch(id int, url string, limit int, intervalTime float64) {
+func startFetch(url string, limit int, intervalTime float64) {
 
-	var Database *pg.DB
-	Database = pg.Connect(&pg.Options{
-		Addr:     addr,
-		User:     user,
-		Password: password,
-		Database: database,
-	})
-
-	defer Database.Close()
-	dboffset := &DBOffset{Id: id}
-	err := Database.Select(dboffset)
+	head, err := fetchHead(url + "/ct/v1/get-sth")
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println(err)
+		// Lets sleep to give head some time
+		log.Fatal("cannot get head.hehe")
 	}
-	Database.Close()
-
-	start := dboffset.Offset
+	start := head.TreeSize
 	end := 0
-	ticketC := 0
-
-	if start == 1 {
-		_, set := os.LookupEnv("fromEnd")
-		if set {
-			head, err := fetchHead(url + "/ct/v1/get-sth")
-			if err != nil {
-				fmt.Println(err)
-				// Lets sleep to give head some time
-				log.Fatal("cannot get head.hehe")
-			}
-			start = head.TreeSize
-			fmt.Printf("sleeping 5 seconds to give head some time to update")
-			time.Sleep(5 * time.Second)
-		}
-	}
 
 	sleep := 0
 
 	ticker := time.NewTicker(time.Duration(intervalTime) * time.Millisecond)
 	go func() {
 		for t := range ticker.C {
-			ticketC++
-			fmt.Println("Tick at", t, url)
 
 			if sleep > 0 {
-				fmt.Println("Sleeping ", sleep)
 				sleep--
 				continue
 			}
+			fmt.Println("Tick at", t, url)
 
 			head, err := fetchHead(url + "/ct/v1/get-sth")
 			if err != nil {
 				fmt.Println(err)
+				sleep = 3
 				continue
 			}
 
@@ -202,7 +165,7 @@ func startFetch(id int, url string, limit int, intervalTime float64) {
 				end = (start + limit) - 1
 			} else if head.TreeSize == start-1 {
 				fmt.Println("up to date, waiting")
-				sleep = 5
+				sleep = 3
 				continue
 			} else {
 				end = head.TreeSize
@@ -213,126 +176,58 @@ func startFetch(id int, url string, limit int, intervalTime float64) {
 			fmt.Println("Start: " + startString + "End: " + endString)
 			response, err := doRequest(url + "/ct/v1/get-entries?start=" + startString + "&end=" + endString)
 			if err != nil {
+				fmt.Println(err)
+				sleep = 3
 				continue
 			}
 			start = end + 1
-			go initRequests(response, url, id)
 
-			if ticketC == 60 {
-				ticketC = 0
-				var Database *pg.DB
-				Database = pg.Connect(&pg.Options{
-					Addr:     addr,
-					User:     user,
-					Password: password,
-					Database: database,
-				})
-				defer Database.Close()
+			fmt.Println("start initRequest now")
 
-				dboffset := &DBOffset{Id: id}
-				err := Database.Select(dboffset)
-				if err != nil {
-					fmt.Println(err)
-
-				}
-
-				dboffset.Offset = end
-				dboffset.LastUpdate = time.Now()
-
-				err = Database.Update(dboffset)
-				if err != nil {
-					fmt.Println(err)
-					fmt.Println("updateJobDBUpdate")
-				}
-
-				Database.Close()
-
-			}
-
+			go initRequests(response)
 		}
 	}()
 }
 
-func initRequests(response Response, url string, id int) {
+func initRequests(response Response) {
 
-	maxLength := len(response.Entries)
-	jobs := make(chan Entry, maxLength)
-	results := make(chan CertJob, maxLength)
+	certs := parse(response.Entries)
 
-	for w := 1; w <= 20; w++ {
-		go parse(w, jobs, results)
-	}
-
-	for _, entry := range response.Entries {
-		jobs <- entry
-	}
-	close(jobs)
-
-	buffers := make(chan bool, 100)
-	var wg sync.WaitGroup
-
-	kafkaURL := "kafka-headless.kafka:9092"
+	kafkaURL := "localhost:9092"
 	topic := "certlog"
 	writer := newKafkaWriter(kafkaURL, topic)
 	defer writer.Close()
 
-	count := 0
-	countBad := 0
-	i := 1
+	for _, cert := range certs {
 
-	for i <= maxLength {
-		i++
-		//<-results
-		certJob := <-results
-		if certJob.Success {
-			wg.Add(1)
+		certPush := CertificatePush{
+			Version:               cert.Version,
+			SerialNumber:          cert.SerialNumber,
+			Issuer:                cert.Issuer,
+			Subject:               cert.Subject,
+			NotBefore:             cert.NotBefore,
+			NotAfter:              cert.NotAfter,
+			OCSPServer:            cert.OCSPServer,
+			IssuingCertificateURL: cert.IssuingCertificateURL,
+			DNSNames:              cert.DNSNames,
+			EmailAddresses:        cert.EmailAddresses,
+			CRLDistributionPoints: cert.CRLDistributionPoints,
+		}
 
-			go func() {
-				buffers <- true
-
-				certPush := CertificatePush{
-					LogId:                 id,
-					LogUrl:                url,
-					Version:               certJob.Cert.Version,
-					SerialNumber:          certJob.Cert.SerialNumber,
-					Issuer:                certJob.Cert.Issuer,
-					Subject:               certJob.Cert.Subject,
-					NotBefore:             certJob.Cert.NotBefore,
-					NotAfter:              certJob.Cert.NotAfter,
-					OCSPServer:            certJob.Cert.OCSPServer,
-					IssuingCertificateURL: certJob.Cert.IssuingCertificateURL,
-					DNSNames:              certJob.Cert.DNSNames,
-					EmailAddresses:        certJob.Cert.EmailAddresses,
-					CRLDistributionPoints: certJob.Cert.CRLDistributionPoints,
-				}
-
-				json, err := json.Marshal(&certPush)
-				if err != nil {
-
-				} else {
-					msg := kafka.Message{
-						Key:   []byte(fmt.Sprintf("cert-%d", certJob.Cert.SerialNumber)),
-						Value: []byte(json),
-					}
-					err := writer.WriteMessages(context.Background(), msg)
-					if err != nil {
-						fmt.Println(err)
-					}
-					count++
-				}
-
-				<-buffers
-				wg.Done()
-			}()
-
+		json, err := json.Marshal(&certPush)
+		if err != nil {
+			fmt.Println(err)
 		} else {
-			countBad++
+			msg := kafka.Message{
+				Key:   []byte(fmt.Sprintf("cert-%d", cert.SerialNumber)),
+				Value: []byte(json),
+			}
+			err := writer.WriteMessages(context.Background(), msg)
+			if err != nil {
+				fmt.Println(err)
+			}
 		}
 	}
-	wg.Wait()
-	fmt.Println("succes", count)
-	fmt.Println("bad", countBad)
-	fmt.Println("iteration", i)
 }
 
 func newKafkaWriter(kafkaURL, topic string) *kafka.Writer {
